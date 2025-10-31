@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "dbf-sync-refactor"
 version = "2.0.0"
 authors = [
-  { name="Ryner Lute" }
+  { name = "Ryner Lute" }
 ]
 description = "Утилита синхронизации DBF-файлов с БД (SQLite / PostgreSQL) с поддержкой временных рядов"
 readme = "README.md"
