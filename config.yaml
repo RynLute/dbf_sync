@@ -1,0 +1,18 @@
+db:
+  type: postgres
+  host: 127.0.0.1
+  port: 5432
+  name: your_data_store
+  user: user
+  password: strong_password
+
+source:
+  folder: C:\base
+  pattern: "????xxxx.dbf"
+  encoding: cp866
+  year: auto
+
+ping_host: 127.0.0.1
+
+state_file: sync_state.json
+log_file: logs/sync.log
