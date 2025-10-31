@@ -1,18 +1,17 @@
-db:
-  type: postgres
-  host: 127.0.0.1
-  port: 5432
-  name: your_data_store
-  user: user
-  password: strong_password
-
 source:
-  folder: C:\base
-  pattern: "????xxxx.dbf"
-  encoding: cp866
-  year: auto
+  folder: ./dbf            # путь к папке с DBF файлами
+  pattern: ????xxxx.dbf     # шаблон поиска файлов, xxxx заменяется на год
 
-ping_host: 127.0.0.1
+db:
+  type: sqlite             # или 'postgres'
+  sqlite_path: ./db.sqlite  # путь к sqlite базе
+  # параметры PostgreSQL (если используется)
+  # host: 127.0.0.1
+  # port: 5432
+  # dbname: reports
+  # user: postgres
+  # password: secret
 
-state_file: sync_state.json
-log_file: logs/sync.log
+state_file: ./state.json   # файл состояния обработанных файлов
+log_file: ./dbf_sync.log   # файл логов
+batch_size: 1000           # размер пакета вставки
