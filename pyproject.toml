@@ -1,4 +1,4 @@
-﻿[tool.poetry]
+[tool.poetry]
 name = "dbf-sync"
 version = "2.0.0"
 description = "Синхронизация DBF-файлов с БД (SQLite/PostgreSQL)"
@@ -27,10 +27,38 @@ target-version = ['py38']
 addopts = "-v --cov=dbf_sync --cov-report=html"
 testpaths = ["tests"]
 
-[tool.pylint]
-master.py-version = "3.8"
-reports.output-format = "colorized"
-messages_control.disable = "missing-module-docstring, missing-function-docstring, invalid-name, too-many-arguments, too-many-locals"
+[tool.pylint.master]
+py-version = "3.8"
+load-plugins = ""
+
+[tool.pylint.reports]
+output-format = "colorized"
+reports = "no"
+
+[tool.pylint.messages_control]
+disable = [
+    "missing-module-docstring",
+    "missing-function-docstring",
+    "invalid-name",
+    "too-many-arguments",
+    "too-many-locals",
+    "import-error",
+    "no-else-return",
+    "broad-except"
+]
+
+[tool.pylint.basic]
+good-names = "i,j,k,ex,e,f,cfg,db,fs,cid"
+
+[tool.pylint.variables]
+dummy-variables-rgx = "_+$|(_[a-zA-Z0-9_]*[a-zA-Z0-9]+?$)|dummy|^ignored_|^unused_"
+
+[tool.pylint.design]
+max-args = 10
+max-locals = 20
+
+[tool.pylint.similarities]
+min-similarity-lines = 6
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
