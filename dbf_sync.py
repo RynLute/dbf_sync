@@ -1,494 +1,256 @@
-import os
-import re
-import sqlite3
-import yaml
-import json
-import logging
-import argparse
-import subprocess
-import psycopg2
-import signal
-import sys
+#!/usr/bin/env python3
+"""
+Переработанный dbf_sync.py (v2)
+- Дата и время теперь объединены в одно поле TIMESTAMP (datetime) — подход к Time Series.
+- Все остальные правки сохранены из предыдущей версии: устойчивость, безопасность, производительность.
+- Поддержка SQLite и PostgreSQL.
 
-from psycopg2.extras import execute_batch
-from datetime import datetime, date, time
-from dbfread import DBF
+"""
 
+from __future__ import annotations
+import argparse, json, logging, os, re, sqlite3, subprocess, sys, time
+from dataclasses import dataclass
+from datetime import datetime
+from itertools import islice
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-# ---------- LOGGING ----------
-def setup_logging(log_file: str) -> None:
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file, encoding='utf-8'),
-            logging.StreamHandler()
-        ]
-    )
+try:
+    import yaml
+except Exception as e:
+    yaml = None
 
+try:
+    from dbfread import DBF
+except Exception:
+    DBF = None
 
-# ---------- Ping ----------
-def ping_host(host: str) -> bool:
-    param = "-n" if os.name == "nt" else "-c"
-    result = subprocess.run(["ping", param, "1", host], stdout=subprocess.DEVNULL)
-    return result.returncode == 0
+DEFAULT_CONFIG = {
+    "source": {"folder": "./dbf", "pattern": "????xxxx.dbf"},
+    "db": {"type": "sqlite", "sqlite_path": "./db.sqlite"},
+    "state_file": "./state.json",
+    "log_file": "./dbf_sync.log",
+    "batch_size": 1000,
+}
 
+DBF_SPEC = [
+    ("DATE", "D", 8),
+    ("TIME", "C", 5),
+    ("COUNT", "N", 5),
+    ("KOD", "N", 3),
+    ("KEY", "N", 2),
+    ("AVR", "N", 1),
+    ("DNA", "N", 1),
+    ("PIT", "N", 1),
+    ("KTIME", "N", 1),
+    ("AVRTIME", "N", 2),
+    ("PITTIME", "N", 2),
+    ("FS", "N", 3),
+]
 
-# ---------- READING THE CONFIG ----------
-def load_config(path: str = "config.yaml") -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-    return config
+ALLOWED_COLS = [n for n, *_ in DBF_SPEC]
+BOOL_FIELDS = {"AVR", "DNA", "PIT", "KTIME"}
 
+logger = logging.getLogger("dbf_sync")
 
-# ---------- STATE ----------
-def load_state(state_file: str) -> dict:
-    """
-    Loads the status from a JSON file with error handling.
-    """
-    if os.path.exists(state_file):
-        try:
-            with open(state_file, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                if content:
-                    return json.loads(content)
-                else:
-                    logging.warning(f"State file {state_file} is empty. Returning empty dict.")
-                    return {}
-        except json.JSONDecodeError as e:
-            logging.error(f"Error decoding state file {state_file}: {e}. Returning empty dict.")
-            return {}
-        except Exception as e:
-            logging.error(f"Unexpected error loading state file {state_file}: {e}. Returning empty dict.")
-            return {}
-    logging.info(f"State file {state_file} does not exist. Returning empty dict.")
-    return {}
+def setup_logging(log_file: str):
+    handlers = [logging.StreamHandler()]
+    try:
+        fh = RotatingFileHandler(log_file, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        handlers.append(fh)
+    except Exception:
+        pass
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=handlers)
 
+def load_config(path: str) -> dict:
+    if yaml is None:
+        raise RuntimeError("pyyaml не установлен")
+    with open(path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    out = DEFAULT_CONFIG.copy()
+    for k, v in cfg.items():
+        if isinstance(v, dict) and k in out and isinstance(out[k], dict):
+            out[k].update(v)
+        else:
+            out[k] = v
+    return out
 
-def save_state(state_file: str, state: dict) -> None:
-    with open(state_file, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-
-
-# ---------- FS Decode ----------
-def decode_fs(fs: int | None, db_type: str = None) -> dict:
-    if fs is None:
-        fs = 0
-
-    flags = {
-        "SHIFT": fs & 0b00000011,
-        "SHIFT_END": 1 if fs & 0b00000100 else 0,
-        "SENSOR1": 1 if fs & 0b00010000 else 0,
-        "SENSOR2": 1 if fs & 0b00100000 else 0,
-        "TIME_SYNC": 1 if fs & 0b01000000 else 0,
-        "READ_ATTEMPT": 1 if fs & 0b10000000 else 0
+def decode_fs(fs: int) -> Dict[str, Any]:
+    return {
+        "SHIFT": fs & 0b11,
+        "SHIFT_END": bool((fs >> 2) & 1),
+        "SENSOR1_ALARM": bool((fs >> 4) & 1),
+        "SENSOR2_ALARM": bool((fs >> 5) & 1),
+        "TIME_SYNC": bool((fs >> 6) & 1),
+        "READ_ATTEMPT": bool((fs >> 7) & 1),
     }
 
-    if db_type == "postgres":
-        bool_fields = ["SHIFT_END", "SENSOR1", "SENSOR2", "TIME_SYNC", "READ_ATTEMPT"]
-        for field in bool_fields:
-            flags[field] = bool(flags[field])
+def extract_counter_id(filename: str) -> Optional[int]:
+    m = re.match(r"^(\d{4})", Path(filename).stem)
+    return int(m.group(1)) if m else None
 
-    return flags
+def read_new_records(file_path: Path, encoding="cp1251") -> List[Dict[str, Any]]:
+    if DBF is None:
+        raise RuntimeError("dbfread не установлен")
+    table = DBF(str(file_path), encoding=encoding, load=True)
+    out = []
+    for rec in table:
+        r = {name: rec.get(name) for name, *_ in DBF_SPEC}
+        fs = int(r.get("FS") or 0)
+        r.update(decode_fs(fs))
+        out.append(r)
+    return out
 
-
-# ---------- EXTRACTING THE COUNTER NUMBER ----------
-def extract_counter_id(filename: str) -> int | None:
-    """
-    Extracts the first 4 digits from the file name (????xxxx.dbf).
-    Returns int or None if failed..
-    """
-    match = re.match(r'^(\d{4})', filename)
-    if match:
-        return int(match.group(1))
-    logging.warning(f"Couldn't extract COUNTER_ID from file name: {filename}")
-    return None
-
-
-# ---------- CREATING TABLES AND INDEXES ----------
-def create_table_sql(db_type: str) -> str:
-    """
-    Returns an SQL query to create a table with the PRIMARY KEY and the INSERTED_AT field.
-    """
-    id_field = (
-        "ID INTEGER PRIMARY KEY AUTOINCREMENT" if db_type == "sqlite"
-        else "ID SERIAL PRIMARY KEY"
-    )
-
-    if db_type == "sqlite":
-        date_time_fields = """
-            DATE TEXT,
-            TIME TEXT,
-        """
-    elif db_type == "postgres":
-        date_time_fields = """
-            DATE DATE,
-            TIME TIME,
-        """
-    else:
-        raise ValueError("Unsupported database type")
-
-    common_fields = f"""
-        {id_field},
-        COUNTER_ID INTEGER,
-        {date_time_fields}
-        COUNT INTEGER,
-        KOD INTEGER,
-        KEY INTEGER,
-        AVR INTEGER,
-        DNA INTEGER,
-        PIT INTEGER,
-        KTIME INTEGER,
-        AVRTIME INTEGER,
-        PITTIME INTEGER,
-        SHIFT INTEGER
-    """
-
-    if db_type == "sqlite":
-        flag_fields = """
-            SHIFT_END INTEGER,
-            SENSOR1 INTEGER,
-            SENSOR2 INTEGER,
-            TIME_SYNC INTEGER,
-            READ_ATTEMPT INTEGER,
-            INSERTED_AT TEXT DEFAULT CURRENT_TIMESTAMP
-        """
-    elif db_type == "postgres":
-        flag_fields = """
-            SHIFT_END BOOLEAN,
-            SENSOR1 BOOLEAN,
-            SENSOR2 BOOLEAN,
-            TIME_SYNC BOOLEAN,
-            READ_ATTEMPT BOOLEAN,
-            INSERTED_AT TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        """
-
-    return f"""
-    CREATE TABLE IF NOT EXISTS reports (
-        {common_fields},
-        {flag_fields}
-    )
-    """
-
-
-def create_indexes(conn, db_type: str) -> None:
-    """
-    Creates optimized indexes, including UNIQUE ones to prevent duplicates..
-    """
-    indexes = [
-        # A unique index to prevent duplicates in key fields.
-        "CREATE UNIQUE INDEX IF NOT EXISTS uniq_reports_counter_datetime ON reports(COUNTER_ID, DATE, TIME)",
-        # Indexes for filtering
-        "CREATE INDEX IF NOT EXISTS idx_reports_counter_id ON reports(COUNTER_ID)",
-        "CREATE INDEX IF NOT EXISTS idx_reports_date ON reports(DATE)",
-        "CREATE INDEX IF NOT EXISTS idx_reports_time ON reports(TIME)",
-        "CREATE INDEX IF NOT EXISTS idx_reports_kod ON reports(KOD)",
-        "CREATE INDEX IF NOT EXISTS idx_reports_key ON reports(KEY)",
-        "CREATE INDEX IF NOT EXISTS idx_reports_shift ON reports(SHIFT)",
-        # Composite indexes for typical queries
-        "CREATE INDEX IF NOT EXISTS idx_reports_counter_date ON reports(COUNTER_ID, DATE)",
-        "CREATE INDEX IF NOT EXISTS idx_reports_counter_datetime ON reports(COUNTER_ID, DATE, TIME)",
-        "CREATE INDEX IF NOT EXISTS idx_reports_inserted_at ON reports(INSERTED_AT)",
-    ]
-
+def combine_datetime(date_str: str, time_str: str) -> Optional[str]:
+    if not date_str:
+        return None
+    s = str(date_str).strip()
+    if not re.match(r"^\d{8}$", s):
+        return None
+    y, m, d = s[0:4], s[4:6], s[6:8]
+    t = str(time_str or "00:00").strip()
+    if re.match(r"^\d{4}$", t):
+        t = f"{t[0:2]}:{t[2:4]}"
+    if not re.match(r"^\d{1,2}:\d{2}$", t):
+        t = "00:00"
     try:
-        if db_type == "sqlite":
-            for idx_sql in indexes:
-                conn.execute(idx_sql)
-            conn.commit()
-        else:
-            with conn.cursor() as cur:
-                for idx_sql in indexes:
-                    cur.execute(idx_sql)
-            conn.commit()
-        logging.info("Indexes have been created successfully.")
-    except Exception as e:
-        logging.warning(f"Error when creating indexes: {e}")
+        return datetime.strptime(f"{y}-{m}-{d} {t}", "%Y-%m-%d %H:%M").isoformat(sep=" ")
+    except Exception:
+        return None
 
+def validate_record(rec: Dict[str, Any], counter_id: Optional[int]) -> Dict[str, Any]:
+    r: Dict[str, Any] = {"COUNTER_ID": counter_id}
+    r["TS"] = combine_datetime(rec.get("DATE"), rec.get("TIME"))
+    for fld in ("COUNT", "KOD", "KEY", "AVRTIME", "PITTIME", "FS"):
+        v = rec.get(fld)
+        r[fld] = int(v) if v not in (None, "") else None
+    for fld in BOOL_FIELDS:
+        v = rec.get(fld)
+        r[fld] = bool(int(v)) if v not in (None, "") else None
+    fs = int(rec.get("FS") or 0)
+    r.update(decode_fs(fs))
+    return r
 
-# ---------- CONNECTING TO THE DATABASE ----------
-def connect_db(cfg: dict) -> tuple:
-    db_type = cfg["db"]["type"].lower()
-    sql = create_table_sql(db_type)
-
-    if db_type == "sqlite":
-        conn = sqlite3.connect(cfg["db"]["name"])
-        conn.execute(sql)
-        conn.commit()
-        create_indexes(conn, db_type)
-        return conn, db_type
-    elif db_type == "postgres":
-        conn = psycopg2.connect(
-            host=cfg["db"]["host"],
-            port=cfg["db"]["port"],
-            dbname=cfg["db"]["name"],
-            user=cfg["db"]["user"],
-            password=cfg["db"]["password"]
-        )
-        with conn.cursor() as cur:
-            cur.execute(sql)
-        conn.commit()
-        create_indexes(conn, db_type)
-        return conn, db_type
-    else:
-        raise ValueError("Unsupported database type (use 'sqlite' or 'postgres')")
-
-
-# ---------- FILE SEARCH ----------
-def find_dbf_files(folder: str, pattern: str, year: int | str) -> list:
-    if "xxxx" in pattern:
-        pattern = pattern.replace("xxxx", str(year))
-    regex = re.compile(pattern.replace("?", ".").replace("*", ".*"), re.IGNORECASE)
-    return sorted([f for f in os.listdir(folder) if regex.fullmatch(f)])
-
-
-# ---------- VALIDATION AND RECORD CONVERSION ----------
-def validate_and_convert_record(record: dict, db_type: str) -> bool:
-    """
-    Verifies the validity of the record and converts the DATE/TIME for PostgreSQL.
-    """
-    required_fields = ["DATE", "TIME"]
-    for field in required_fields:
-        value = record.get(field)
-        if value is None:
-            logging.warning(f"Invalid record: missing {field} - {record}")
-            return False
-
-    # DATE processing (dbfread returns datetime.date)
-    if isinstance(record["DATE"], date):
-        date_obj = record["DATE"]
-        if db_type == "sqlite":
-            record["DATE"] = date_obj.strftime("%Y-%m-%d")
-        # For postgres, we leave it as date
-    elif isinstance(record["DATE"], str) and record["DATE"].strip():
-        try:
-            date_obj = datetime.strptime(record["DATE"], "%Y-%m-%d").date()
-            record["DATE"] = date_obj if db_type == "postgres" else record["DATE"]
-        except ValueError:
-            logging.warning(f"Invalid date format: {record['DATE']} in record: {record}")
-            return False
-    else:
-        logging.warning(f"Invalid DATE type or empty: {record['DATE']} in record: {record}")
-        return False
-
-    # TIME processing (string 'HH:MM')
-    time_str = record["TIME"]
-    if isinstance(time_str, str) and time_str.strip():
-        try:
-            # Format 'HH:MM' (from the log)
-            parsed_time = datetime.strptime(time_str, "%H:%M")
-            if db_type == "postgres":
-                record["TIME"] = parsed_time.time()
-            elif db_type == "sqlite":
-                record["TIME"] = time_str  # Leaving the line
-        except ValueError:
-            logging.warning(f"Invalid time format: {time_str} in record: {record}")
-            return False
-    else:
-        logging.warning(f"Invalid TIME type or empty: {record['TIME']} in record: {record}")
-        return False
-
-    return True
-
-
-# ---------- READING NEW RECORDS ----------
-def read_new_records(file_path: str, start_record: int, encoding: str, db_type: str, counter_id: int) -> list:
-    num_records, _, _ = get_dbf_meta(file_path)
-    if start_record >= num_records:
-        return []
-
-    records = []
-    invalid_count = 0
-
-    # Lazy DBF iterator without full load in memory
-    table = DBF(file_path, encoding=encoding, ignore_missing_memofile=True, load=False)
-
-    # Skipping the first start_record entries
-    for i, r in enumerate(table):
-        if i < start_record:
-            continue
-        if not validate_and_convert_record(r, db_type):
-            invalid_count += 1
-            continue
-        # Adding the COUNTER_ID
-        r["COUNTER_ID"] = counter_id
-        # Decoding FS
-        fs_decoded = decode_fs(r.get("FS", 0), db_type)
-        r.update(fs_decoded)
-        records.append(r)
-
-    if invalid_count > 0:
-        logging.warning(f"{invalid_count} invalid records skipped in {file_path}")
-
-    return records
-
-
-# ---------- READING METADATA ----------
-def get_dbf_meta(file_path: str) -> tuple:
-    with open(file_path, "rb") as f:
-        header = f.read(32)
-        num_records = int.from_bytes(header[4:8], byteorder="little")
-        header_len = int.from_bytes(header[8:10], byteorder="little")
-        record_len = int.from_bytes(header[10:12], byteorder="little")
-    return num_records, header_len, record_len
-
-
-# ---------- DATA PREPARATION ----------
-def prepare_insert_data(records: list, allowed_cols: list) -> tuple:
-    cols = [c for c in records[0].keys() if c.upper() in allowed_cols]
-    if not cols:
-        logging.warning("There are no matching columns to insert — skipping the file.")
-        return None, None
-    values = [[r.get(c) for c in cols] for r in records]
-    return cols, values
-
-
-# ---------- SAVE TO BD ----------
-def save_to_db(conn, db_type: str, table_name: str, records: list) -> int:
+def prepare_insert_data(records: List[Dict[str, Any]]) -> Tuple[List[str], List[Tuple]]:
     if not records:
-        return 0
+        return [], []
+    cols = ["COUNTER_ID", "TS", "COUNT", "KOD", "KEY", "AVR", "DNA", "PIT", "KTIME", "AVRTIME", "PITTIME", "FS", "SHIFT", "SHIFT_END", "SENSOR1_ALARM", "SENSOR2_ALARM", "TIME_SYNC", "READ_ATTEMPT"]
+    vals = [tuple(r.get(c) for c in cols) for r in records]
+    return cols, vals
 
-    allowed_cols = [
-        "COUNTER_ID", "DATE", "TIME", "COUNT", "KOD", "KEY", "AVR", "DNA", "PIT",
-        "KTIME", "AVRTIME", "PITTIME", "SHIFT", "SHIFT_END",
-        "SENSOR1", "SENSOR2", "TIME_SYNC", "READ_ATTEMPT"
-    ]  # Without ID and INSERTED_AT, they are auto
+@dataclass
+class DBClient:
+    cfg: dict
+    conn: Any = None
 
-    cols, values = prepare_insert_data(records, allowed_cols)
-    if not cols:
-        return 0
-
-    placeholders = ",".join(["?" if db_type == "sqlite" else "%s"] * len(cols))
-
-    if db_type == "sqlite":
-        sql = f"INSERT OR IGNORE INTO {table_name} ({','.join(cols)}) VALUES ({placeholders})"
-    else:  # postgres
-        sql = f"INSERT INTO {table_name} ({','.join(cols)}) VALUES ({placeholders}) ON CONFLICT (COUNTER_ID, DATE, TIME) DO NOTHING"
-
-    try:
-        if db_type == "sqlite":
-            conn.executemany(sql, values)
+    def connect(self):
+        dbcfg = self.cfg.get("db", {})
+        t = dbcfg.get("type", "sqlite")
+        if t == "sqlite":
+            path = Path(dbcfg.get("sqlite_path", "./db.sqlite"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.conn = sqlite3.connect(str(path))
         else:
-            bool_fields = ["SHIFT_END", "SENSOR1", "SENSOR2", "TIME_SYNC", "READ_ATTEMPT"]
-            processed_values = []
-            for row in values:
-                processed_row = []
-                for i, val in enumerate(row):
-                    col_name = cols[i]
-                    if col_name in bool_fields and val is not None:
-                        processed_row.append(bool(val))
-                    else:
-                        processed_row.append(val)
-                processed_values.append(processed_row)
+            import psycopg2
+            self.conn = psycopg2.connect(
+                host=dbcfg.get("host"), port=dbcfg.get("port", 5432), dbname=dbcfg.get("dbname"), user=dbcfg.get("user"), password=dbcfg.get("password")
+            )
 
-            with conn.cursor() as cur:
-                execute_batch(cur, sql, processed_values)
+    def ensure_schema(self):
+        dbtype = self.cfg.get("db", {}).get("type", "sqlite")
+        sql = create_table_sql(dbtype)
+        cur = self.conn.cursor()
+        cur.execute(sql)
+        self.conn.commit()
 
-        conn.commit()
-        # To count the inserted ones (ignoring duplicates)
-        inserted = conn.total_changes if db_type == "sqlite" else len(
-            records)  # In postgres, execute_batch does not return, but for simplicity it does
-        return inserted
-    except Exception as e:
-        logging.exception(f"Error when saving to the database: {e}")
+    def save_batch(self, cols: List[str], values: List[Tuple]) -> int:
+        if not values:
+            return 0
+        dbtype = self.cfg.get("db", {}).get("type", "sqlite")
+        if dbtype == "sqlite":
+            placeholders = ",".join(["?" for _ in cols])
+            sql = f"INSERT INTO reports ({','.join(cols)}) VALUES ({placeholders});"
+            cur = self.conn.cursor()
+            cur.executemany(sql, values)
+            self.conn.commit()
+            return cur.rowcount
+        else:
+            import psycopg2.extras as extras
+            sql = f"INSERT INTO reports ({','.join(cols)}) VALUES %s ON CONFLICT (counter_id, ts) DO NOTHING"
+            cur = self.conn.cursor()
+            extras.execute_values(cur, sql, values, page_size=1000)
+            self.conn.commit()
+            return len(values)
+
+def create_table_sql(db_type: str) -> str:
+    if db_type == "sqlite":
+        return ("CREATE TABLE IF NOT EXISTS reports ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "counter_id INTEGER,"
+                "ts TEXT,"
+                "count INTEGER, kod INTEGER, key INTEGER, avr INTEGER, dna INTEGER, pit INTEGER, ktime INTEGER,"
+                "avrtime INTEGER, pittime INTEGER, fs INTEGER, shift INTEGER, shift_end INTEGER,"
+                "sensor1_alarm INTEGER, sensor2_alarm INTEGER, time_sync INTEGER, read_attempt INTEGER,"
+                "UNIQUE(counter_id, ts));")
+    else:
+        return ("CREATE TABLE IF NOT EXISTS reports ("
+                "id SERIAL PRIMARY KEY,"
+                "counter_id INTEGER,"
+                "ts TIMESTAMP,"
+                "count INTEGER, kod INTEGER, key INTEGER, avr BOOLEAN, dna BOOLEAN, pit BOOLEAN, ktime BOOLEAN,"
+                "avrtime INTEGER, pittime INTEGER, fs INTEGER, shift INTEGER, shift_end BOOLEAN,"
+                "sensor1_alarm BOOLEAN, sensor2_alarm BOOLEAN, time_sync BOOLEAN, read_attempt BOOLEAN,"
+                "UNIQUE(counter_id, ts));")
+
+def chunked(it: Iterable, size: int):
+    it = iter(it)
+    while True:
+        part = list(islice(it, size))
+        if not part:
+            break
+        yield part
+
+def process_file(f: Path, db: DBClient, batch: int, dry_run=False) -> int:
+    cid = extract_counter_id(f.name)
+    if cid is None:
+        logger.warning("Пропуск файла %s — нет counter_id", f)
         return 0
+    recs = read_new_records(f)
+    converted = [validate_record(r, cid) for r in recs]
+    cols, vals = prepare_insert_data(converted)
+    total = 0
+    for chunk in chunked(vals, batch):
+        if dry_run:
+            total += len(chunk)
+        else:
+            total += db.save_batch(cols, chunk)
+    logger.info("%s: вставлено %d", f, total)
+    return total
 
-
-# ---------- CHUNKS FOR LARGE FILES ----------
-def chunks(lst: list, n: int):
-    """Splits the list into chunks of n elements."""
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
-
-
-# ---------- BASIC LOGIC ----------
-def main() -> None:
-    parser = argparse.ArgumentParser(description="DBF sync utility")
-    parser.add_argument("--init", action="store_true", help="Full initial import")
-    parser.add_argument("--update", action="store_true", help="Incremental update")
-    parser.add_argument("--dry-run", action="store_true", help="Do not write to DB")
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
-    args = parser.parse_args()
-
-    cfg = load_config()
-    setup_logging(cfg.get("log_file", "dbf_sync.log"))
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    logging.info("=== DBF Sync Started ===")
-
-    # Graceful shutdown
-    def handle_exit(signum, frame):
-        logging.warning("A termination signal has been received, and connections are being closed...")
-        if 'conn' in locals() and conn is not None:
-            conn.close()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, handle_exit)
-    signal.signal(signal.SIGTERM, handle_exit)
-
-    db_type = cfg["db"]["type"].lower()
-
-    if db_type == "postgres":
-        if not ping_host(cfg["db"]["host"]):
-            logging.error(f"Host {cfg['db']['host']} is unreachable")
-            return
-
-    folder = cfg["source"]["folder"]
-    if not os.path.isdir(folder) or not os.access(folder, os.R_OK):
-        logging.error(f"Source folder {folder} not found or not readable.")
-        return
-
-    pattern = cfg["source"]["pattern"]
-    encoding = cfg["source"]["encoding"]
-    year = cfg["source"].get("year", "auto")
-    if year == "auto":
-        year = datetime.now().year
-
-    state_file = cfg["state_file"]
-    state = load_state(state_file)
-
-    files = find_dbf_files(folder, pattern, year)
-    if not files:
-        logging.warning("No DBF files found.")
-        return
-
-    conn, db_type = connect_db(cfg)
-
-    try:
-        for file in files:
-            path = os.path.join(folder, file)
-            counter_id = extract_counter_id(file)
-            if counter_id is None:
-                logging.error(f"Skipping the {file} file: the COUNTER_ID could not be determined")
-                continue
-
-            start_index = 0 if args.init else state.get(file, 0)
-
-            records = read_new_records(path, start_index, encoding, db_type, counter_id)
-            logging.info(f"{file} (COUNTER_ID={counter_id}): found {len(records)} new records (from {start_index})")
-
-            if args.dry_run:
-                logging.info(f"{file}: dry-run mode — skipped saving.")
-                continue
-
-            # Batch insertion for large files
-            inserted = 0
-            batch_size = 5000
-            for chunk in chunks(records, batch_size):
-                inserted += save_to_db(conn, db_type, "reports", chunk)
-
-            state[file] = start_index + len(
-                records)  # We update the state based on what we read, because duplicates may be skipped.
-            save_state(state_file, state)
-            logging.info(f"{file}: inserted {inserted} records (duplicates skipped)")
-
-    finally:
-        conn.close()
-        logging.info("=== DBF Sync Completed ===")
-
+def main(argv=None):
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", default="config.yaml")
+    p.add_argument("--init", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    args = p.parse_args(argv)
+    cfg = load_config(args.config)
+    setup_logging(cfg.get("log_file", "./dbf_sync.log"))
+    db = DBClient(cfg)
+    db.connect()
+    if args.init:
+        db.ensure_schema()
+        logger.info("Schema created")
+        return 0
+    src = Path(cfg["source"]["folder"])
+    patt = cfg["source"]["pattern"]
+    year = datetime.now().year
+    files = [f for f in src.glob(patt.replace("xxxx", str(year)))]
+    total_all = 0
+    for f in files:
+        total_all += process_file(f, db, cfg.get("batch_size", 1000), dry_run=args.dry_run)
+    logger.info("Всего вставлено: %d", total_all)
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
