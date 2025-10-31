@@ -1,0 +1,31 @@
+MASTER:
+  python-version: "3.8"  # Совместимо с проектом
+  load-plugins: ""  # Если нужны расширения, добавить здесь
+
+REPORTS:
+  output-format: colorized
+  reports: no  # Отключить детальные отчеты для CI
+
+MESSAGES CONTROL:
+  disable:
+    - missing-module-docstring  # Игнор docstring для модулей
+    - missing-function-docstring  # Игнор docstring для функций
+    - invalid-name  # Разрешить нестандартные имена (для legacy-кода)
+    - too-many-arguments  # Много аргументов в функциях (main и т.д.)
+    - too-many-locals  # Много локальных переменных
+    - import-error  # Игнор ошибок импорта (для опциональных deps как psycopg2)
+    - no-else-return  # Разрешить else после return
+    - broad-except  # Разрешить except Exception (в коде есть)
+
+BASIC:
+  good-names: i,j,k,ex,e,f,cfg,db,fs,cid  # Разрешенные короткие имена
+
+VARIABLES:
+  dummy-variables-rgx: _+$|(_[a-zA-Z0-9_]*[a-zA-Z0-9]+?$)|dummy|^ignored_|^unused_  # Игнор переменных
+
+DESIGN:
+  max-args: 10  # Увеличить лимит аргументов
+  max-locals: 20  # Увеличить лимит локальных
+
+SIMILARITIES:
+  min-similarity-lines: 6  # Увеличить порог для дубликатов
