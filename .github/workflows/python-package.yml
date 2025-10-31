@@ -1,4 +1,4 @@
-﻿name: Python Package
+name: Python Package
 
 on:
   push:
@@ -21,7 +21,7 @@ jobs:
         pip install poetry pylint
         poetry install
     - name: Lint with pylint
-      run: poetry run pylint **/*.py --rcfile=pylint.yml
+      run: poetry run pylint **/*.py  # Автоматически использует pyproject.toml
 
   test:
     runs-on: ubuntu-latest
