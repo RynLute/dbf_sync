@@ -25,3 +25,7 @@ dbf-sync = "dbf_sync_refactor:main"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+
+[tool.pylint.'MESSAGES CONTROL']
+max-line-length = 120
+disable = "too-many-arguments,not-callable"
